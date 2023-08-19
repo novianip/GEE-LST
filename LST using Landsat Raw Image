@@ -1,0 +1,176 @@
+//*************** LST using Landsat Raw Image************************//
+// // ---cloud masking ver 1
+// function maskl8(image){
+//   var qa = image.select('QA_PIXEL');
+//   var dilated = 1 << 1;
+//   var cirrus = 1 << 2;
+//   var cloud = 1 << 3;
+//   var shadow = 1 << 4;
+  
+//   var mask = qa.bitwiseAnd(dilated).eq(0)
+//     .and(qa.bitwiseAnd(cirrus).eq(0))
+//     .and(qa.bitwiseAnd(cloud).eq(0))
+//     .and(qa.bitwiseAnd(shadow).eq(0));
+    
+//   return image.updateMask(mask);
+// }
+
+//---cloud masking ver 2
+function maskl8(image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  // Get the pixel QA band.
+  var qa = image.select('QA_PIXEL');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+// 
+
+//ALL BAND IN LANDSAT 8//
+var landsat8 = ee.ImageCollection("LANDSAT/LC08/C02/T1")
+                    .filterBounds(aoi)
+                    .filterDate('2021-01-01','2021-12-31')
+                    .sort('CLOUD_COVER')
+                    .map(maskl8)
+                    .mean()
+print(landsat8)
+var landsat8_fix = landsat8.select('B2','B3', 'B4', 'B5', 'B6', 'B7', 'B10')
+                  .clip(aoi)
+
+
+//SELECT BAND THERMAL
+var band10 = ee.ImageCollection("LANDSAT/LC08/C02/T1")
+                    .filterBounds(aoi)
+                    .filterDate('2013-03-18','2022-12-30')
+                    .sort('CLOUD_COVER')
+                    .map(maskl8)
+                    .select('B10');
+
+var band10_fix = band10.first();
+
+// //landsat8_fix = landsat8_fix.map(applyScaleFactors);
+print(landsat8_fix)
+// //Map.addLayer(landsat8_fix)
+
+//***----NDVI L8 2021
+var nir = landsat8_fix.select ('B5')
+var red = landsat8_fix.select ('B4')
+var ndvi = landsat8_fix.normalizedDifference(['B5', 'B4']).rename('NDVI L8')
+            .clip(aoi);
+
+
+// //find the min and max of NDVI
+{
+var min_ndvi = ee.Number(ndvi.reduceRegion({
+              reducer: ee.Reducer.min(),
+              geometry: ndvi.geometry(),
+              scale: 30,
+              maxPixels: 1e9
+              }).values().get(0));
+print(min_ndvi, 'min ndvi');
+
+var max_ndvi = ee.Number(ndvi.reduceRegion({
+              reducer: ee.Reducer.max(),
+              geometry: ndvi.geometry(),
+              scale: 30,
+              maxPixels: 1e9
+              }).values().get(0));
+
+print(max_ndvi, 'max ndvi')
+}
+
+//fractional vegetation
+{
+var fv =(ndvi.subtract(min_ndvi).divide(max_ndvi.subtract(min_ndvi))).pow(ee.Number(2)).rename('FV'); 
+print(fv, 'fv');
+Map.addLayer(fv);
+}
+
+// //Emissivity
+
+var a= ee.Number(0.004);
+var b= ee.Number(0.986);
+var EM = fv.multiply(a).add(b).rename('EMM');
+var imageVisParam3 = {min: 0.9865619146722164, max:0.989699971371314};
+Map.addLayer(EM, imageVisParam3,'EMM');
+
+//---Calculate Brightness Temperature (to celcius) from Landsat 8 RAW----///
+var A = band10_fix.get('RADIANCE_ADD_BAND_10')
+var B = band10_fix.get('RADIANCE_MULT_BAND_10')
+var K1 = band10_fix.get('K1_CONSTANT_BAND_10')
+var K2 = band10_fix.get('K2_CONSTANT_BAND_10')
+print (A);
+print (B);
+print (K1);
+print (K2);
+
+//Brightness Temperature karena dari Landsat Raw atau TOA, kalau dari SR tinggal dikali faktor koreksi
+var BT = band10.map(function(img){
+  var id = img.id();
+  return img.expression('((1321.0789/(log(774.8853/((TIR*0.0003342)+0.1)+1)))-273.15)'
+  , {'TIR':img})
+  .rename('B10')
+  .copyProperties(img, ['system: time_start']);
+});
+
+print(BT)
+// //Reduce LST using mean//
+var LST1 = BT.mean().clip(aoi);
+
+// LST in Celsius Degree bring -273.15
+// NB: In Kelvin don't bring -273.15
+var LST = LST1.expression(
+'(Tb/(1 + (0.00115* (Tb / 1.438))*log(Ep)))', {
+'Tb': LST1.select('B10'),
+'Ep': EM.select('EMM')
+}).rename('LST');
+
+//min max LST
+{
+var minLST = ee.Number(LST.reduceRegion({
+                  reducer: ee.Reducer.min(),
+                  scale: 30,
+                  maxPixels: 1e9
+                  }).values().get(0));
+                  print(minLST, 'minLST');
+
+var maxLST = ee.Number(LST.reduceRegion({
+                reducer: ee.Reducer.max(),
+                scale: 30,
+                maxPixels: 1e9
+                }).values().get(0));
+                print(maxLST, 'maxLST')
+                }
+
+//******LST FOR VALIDATION START**********///
+
+var LSTbdg = LST.clip(bdg)
+
+var meanLST = ee.Number(LST.reduceRegion({
+                reducer: ee.Reducer.mean(),
+                scale: 30,
+                maxPixels: 1e9
+                }).values().get(0));
+                print(meanLST, 'meanLST')
+                
+
+print(LST, 'LST')
+Map.addLayer(LSTbdg, {min: 3.051632429027145, max:31.742770361312306, palette: [
+'040274', '040281', '0502a3', '0502b8', '0502ce', '0502e6',
+'0602ff', '235cb1', '307ef3', '269db1', '30c8e2', '32d3ef',
+'3be285', '3ff38f', '86e26f', '3ae237', 'b5e22e', 'd6e21f',
+'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
+'ff0000', 'de0101', 'c21301', 'a71001', '911003'
+]},'LST');
+
+print(LST)
+
+Export.image.toDrive({
+  image: LST,
+  scale : 10,
+  description: 'LST_2013-2022',
+  region: aoi,
+});
